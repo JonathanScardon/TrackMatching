@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+
+import argparse
+import sys
+
+from IPython import get_ipython
+from PyQt5.QtWidgets import QApplication
+
+from fixtrack.frontend.gui import FixtrackWindow
+
+# If we are running ipython interactive we have to set the gui to qt5
+ipython = get_ipython()
+if ipython is not None:
+    ipython.magic("%gui qt5")
+
+#Retrieve user arguments in form: video_name --track track_name
+parser = argparse.ArgumentParser()
+parser.add_argument("video", type=str, help="Video left file name")
+parser.add_argument("video2", type=str, help = "Video right file name")
+parser.add_argument("--track", type=str, default=None, help="Track H5 file name if one exists")
+parser.add_argument("--track2", type=str, default=None, help="Right video dataset")
+parser.add_argument("--candidates", type=str, help="Candidate matching results file")
+parser.add_argument(
+    "--no-range-slider", action="store_true", help="Don't create a selection range slider"
+)
+
+args = parser.parse_args()
+
+app = QApplication(sys.argv)
+
+#initialize GUI with user arguments
+main_win = FixtrackWindow(args.video, args.video2, args.track, args.track2, args.candidates, not args.no_range_slider)
+main_win.show()
+sys.exit(app.exec_())
