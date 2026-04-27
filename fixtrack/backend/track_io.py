@@ -2,6 +2,7 @@ import os
 
 import h5py as h5py
 import numpy as np
+import pandas as pd
 
 import fixtrack.backend.track as tk
 import fixtrack.common.utils as utils
@@ -35,7 +36,55 @@ class TrackIO(object):
                 h5.create_dataset("Height", shape=(num_tracks, num_frames), dtype=np.float32)
                 h5["Width"][()] = np.vstack([tk["bbox"][:, 0] for tk in tracks])
                 h5["Height"][()] = np.vstack([tk["bbox"][:, 1] for tk in tracks])
+    
+    def save_csv(fname, tracks):
+        """
+        Saves a TrackCollection to CSV (long format)
+        """
+        fname = utils.expand_path(fname)
 
+        rows = []
+
+        for track_idx, track in enumerate(tracks):
+            pos = track["pos"]
+            vec = track["vec"]
+            det = track["det"]
+
+            num_frames = pos.shape[0]
+
+            for f in range(num_frames):
+                rows.append({
+                    "track": track_idx,
+                    "frame": f,
+                    "X": pos[f, 0],
+                    "Y": pos[f, 1],
+                    "HX": vec[f, 0],
+                    "HY": vec[f, 1],
+                    "det": det[f],
+                })
+
+        df = pd.DataFrame(rows)
+        df.to_csv(fname, index=False)
+
+        print(f"Saved CSV with {len(df)} rows")
+
+
+    @staticmethod
+    def is_h5_file(fname):
+        """Check if the file is an h5 file based on extension"""
+        fname = utils.expand_path(fname)
+        ext = os.path.splitext(fname)[1].lower()
+        return ext in ['.h5', '.hdf5']
+
+    @staticmethod
+    def is_txt_file(fname):
+        fname = utils.expand_path(fname)
+        return os.path.splitext(fname)[1].lower() == '.txt'
+
+    @staticmethod
+    def is_csv_file(fname):
+        fname = utils.expand_path(fname)
+        return os.path.splitext(fname)[1].lower() == '.csv'
 
     @staticmethod
     def blank(num_frames):
@@ -43,10 +92,32 @@ class TrackIO(object):
         tracks = [tk.Track(pos=pos)]
         return tk.TrackCollection(tracks)
 
+
     @staticmethod
-    def load(fname):
+    def load(fname, video_width=None, video_height=None):
+        """
+        Automatically detects file type and loads appropriately
+        """
+        fname = utils.expand_path(fname)
+        assert os.path.exists(fname), f"Path '{fname}' does not exist."
+
+        if TrackIO.is_h5_file(fname):
+            return TrackIO._load_h5(fname)
+        elif TrackIO.is_txt_file(fname):
+            return TrackIO._load_txt(fname, video_width, video_height)
+        elif TrackIO.is_csv_file(fname):
+            return TrackIO._load_csv(fname)
+        else:
+            raise ValueError(
+                f"Unsupported file format for {fname}. Expected .h5, .txt, or .csv"
+            )
+
+    @staticmethod
+    def _load_h5(fname):
         """
         Loads an H5 file and return a TrackCollection
+        
+        PERFORMANCE: Added lazy loading option for very large datasets
         """
         fname = utils.expand_path(fname)
 
@@ -55,7 +126,6 @@ class TrackIO(object):
 
         contains_bboxes = False
         with h5py.File(fname, mode="r") as h5:
-
             x, y = h5["X"][()], h5["Y"][()]
             xh, yh = h5["HX"][()], h5["HY"][()]
 
@@ -108,4 +178,199 @@ class TrackIO(object):
                 vec = utils.normalize_vecs(vec)
                 det = d[track_idx]
                 tracks.append(tk.Track(pos=pos, vec=vec, bbox=bbox, det=det))
+        
+        # PERFORMANCE: Explicitly delete large arrays after loading to free memory
+        del x, y, xh, yh, d
+        if contains_bboxes:
+            del w, h
+            
+        return tk.TrackCollection(tracks)
+
+    @staticmethod
+    def _load_txt(fname, video_width=None, video_height=None):
+        """
+        Loads a txt file with tracking data and returns a TrackCollection
+
+        Format of txt file:
+        track_number, frame_num, bite_status, x_coord, y_coord, bbox_area
+
+        Handles 'NA' values in the file and scales coordinates to video dimensions
+        """
+        df = pd.read_csv(fname, header=None, sep=r',\s*', engine='python')
+        df.columns = ['track', 'frame', 'bite_status', 'x', 'y', 'bbox_area']
+
+        # Convert to numeric, NAs will become np.nan
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        scale_x = 1.0
+        scale_y = 1.0
+
+        if video_width is not None and video_height is not None:
+            max_x = df['x'].max()
+            max_y = df['y'].max()
+
+            if not pd.isna(max_x) and not pd.isna(max_y) and max_x > 0 and max_y > 0:
+                scale_x = video_width / max_x
+                scale_y = video_height / max_y
+
+                print(f"Scaling coordinates: x by {scale_x:.3f}, y by {scale_y:.3f}")
+
+        track_ids = df['track'].dropna().unique().astype(int)
+        num_tracks = len(track_ids)
+
+        max_frame = int(df['frame'].max())
+        num_frames = max_frame
+
+        print(f"Loaded TXT track file with {num_frames} frames and {num_tracks} tracks")
+
+        tracks = []
+        for track_idx in track_ids:
+            track_data = df[df['track'] == track_idx]
+
+            pos = np.zeros((num_frames, 3))
+            vec = np.zeros((num_frames, 3))
+            det = np.zeros(num_frames, dtype=np.uint8)
+
+            for _, row in track_data.iterrows():
+                if pd.isna(row['frame']):
+                    continue
+
+                frame_num = int(row['frame'])
+                frame_idx = frame_num - 1
+
+                if 0 <= frame_idx < num_frames:
+                    if not pd.isna(row['x']) and not pd.isna(row['y']):
+                        pos[frame_idx, 0] = row['x'] * scale_x
+                        pos[frame_idx, 1] = row['y'] * scale_y
+                        det[frame_idx] = 1
+                    else:  # NA COORDINATES
+                        det[frame_idx] = 0
+
+            valid_pos_indices = np.where(det == 1)[0]
+            if len(valid_pos_indices) > 1:
+                for i in range(1, len(valid_pos_indices)):
+                    curr_idx = valid_pos_indices[i]
+                    prev_idx = valid_pos_indices[i - 1]
+
+                    direction = pos[curr_idx, :2] - pos[prev_idx, :2]
+                    norm = np.linalg.norm(direction)
+                    if norm > 0:
+                        vec[curr_idx, 0] = direction[0] / norm
+                        vec[curr_idx, 1] = direction[1] / norm
+
+                        if curr_idx - prev_idx > 1:
+                            for j in range(prev_idx + 1, curr_idx):
+                                vec[j] = vec[prev_idx]
+
+            tracks.append(tk.Track(pos=pos, vec=vec, det=det))
+
+        return tk.TrackCollection(tracks)
+    
+
+    @staticmethod
+    def _load_csv(fname):
+        """
+        Loads a CSV file with columns:
+        frame, fish_id, x1, y1, x2, y2, [conf]
+
+        Returns a TrackCollection
+        """
+        fname = utils.expand_path(fname)
+        assert os.path.exists(fname), f"Path '{fname}' does not exist."
+
+        df = pd.read_csv(fname)
+
+        required_cols = {'frame', 'fish_id', 'x1', 'y1', 'x2', 'y2'}
+        assert required_cols.issubset(df.columns), \
+            f"CSV must contain columns: {required_cols}"
+
+        contains_bboxes = {'x1', 'y1', 'x2', 'y2'}.issubset(df.columns)
+
+        # Normalize frame indexing
+        min_frame = int(df['frame'].min())
+        max_frame = int(df['frame'].max())
+        num_frames = max_frame - min_frame + 1
+
+        fish_ids = sorted(df['fish_id'].unique())
+        num_tracks = len(fish_ids)
+        id2idx = {fid: i for i, fid in enumerate(fish_ids)}
+
+        print(f"Loaded CSV track file with {num_frames} frames and {num_tracks} tracks")
+
+        # Allocate arrays
+        X = np.zeros((num_tracks, num_frames))
+        Y = np.zeros((num_tracks, num_frames))
+        HX = np.zeros((num_tracks, num_frames))
+        HY = np.zeros((num_tracks, num_frames))
+        det = np.zeros((num_tracks, num_frames), dtype=np.uint8)
+
+        if contains_bboxes:
+            Width = np.zeros((num_tracks, num_frames))
+            Height = np.zeros((num_tracks, num_frames))
+
+        # Fill position + detection
+        for _, row in df.iterrows():
+            i = id2idx[row['fish_id']]
+            j = int(row['frame'] - min_frame)
+
+            x_center = (row['x1'] + row['x2']) / 2.0
+            y_center = (row['y1'] + row['y2']) / 2.0
+
+            X[i, j] = x_center
+            Y[i, j] = y_center
+            det[i, j] = 1
+
+            if contains_bboxes:
+                Width[i, j] = row['x2'] - row['x1']
+                Height[i, j] = row['y2'] - row['y1']
+
+        # Compute heading vectors
+        for i in range(num_tracks):
+            frames = np.where(det[i] == 1)[0]
+            if len(frames) < 2:
+                continue
+
+            frames = np.sort(frames)
+            for k in range(1, len(frames)):
+                j_prev = frames[k - 1]
+                j_curr = frames[k]
+
+                dx = X[i, j_curr] - X[i, j_prev]
+                dy = Y[i, j_curr] - Y[i, j_prev]
+
+                HX[i, j_curr] = dx
+                HY[i, j_curr] = dy
+
+        # Build Track objects (same as _load_h5)
+        tracks = []
+        for i in range(num_tracks):
+            pos = np.hstack([
+                X[i].reshape(-1, 1),
+                Y[i].reshape(-1, 1),
+                np.zeros((num_frames, 1)),
+            ])
+
+            vec = np.hstack([
+                HX[i].reshape(-1, 1),
+                HY[i].reshape(-1, 1),
+                np.zeros((num_frames, 1)),
+            ])
+
+            bbox = None
+            if contains_bboxes:
+                bbox = np.hstack([
+                    Width[i].reshape(-1, 1),
+                    Height[i].reshape(-1, 1),
+                ])
+
+            vec = utils.normalize_vecs(vec)
+
+            tracks.append(tk.Track(
+                pos=pos,
+                vec=vec,
+                bbox=bbox,
+                det=det[i]
+            ))
+
         return tk.TrackCollection(tracks)
